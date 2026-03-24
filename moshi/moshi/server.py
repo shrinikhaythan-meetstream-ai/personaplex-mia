@@ -35,6 +35,7 @@ import time
 import secrets
 import sys
 from typing import Literal, Optional
+from dotenv import load_dotenv
 
 import aiohttp
 from aiohttp import web
@@ -45,10 +46,32 @@ import sphn
 import torch
 import random
 
+# Load .env file for AWS configuration
+load_dotenv()
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+# Validate AWS configuration
+if not AWS_REGION:
+    raise RuntimeError("[FATAL] AWS_REGION environment variable not set. Please add to .env file.")
+if not AWS_ACCESS_KEY_ID:
+    raise RuntimeError("[FATAL] AWS_ACCESS_KEY_ID environment variable not set. Please add to .env file.")
+if not AWS_SECRET_ACCESS_KEY:
+    raise RuntimeError("[FATAL] AWS_SECRET_ACCESS_KEY environment variable not set. Please add to .env file.")
+
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .context_manager import ContextManager
+from .aws_transcriber import AWSTranscriber
+
+try:
+    import resampy
+    RESAMPY_AVAILABLE = True
+except ImportError:
+    RESAMPY_AVAILABLE = False
 
 
 logger = setup_logger(__name__)
@@ -140,6 +163,15 @@ class ServerState:
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
 
+        # Initialize ContextManager for this session
+        context_manager = ContextManager(developer_prompt="", max_history=15)
+        clog.log("info", "[INIT] ContextManager initialized for this session")
+        
+        # Initialize single persistent AWS Transcriber for this session
+        aws_transcriber = AWSTranscriber(context_manager)
+        await aws_transcriber.start()
+        clog.log("info", "[INIT] AWS Transcriber started (single persistent stream)")
+
         # self.lm_gen.temp = float(request.query["audio_temperature"])
         # self.lm_gen.temp_text = float(request.query["text_temperature"])
         # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
@@ -167,7 +199,26 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+        
+        # Get original prompt from request
+        original_prompt = request.query["text_prompt"] if len(request.query["text_prompt"]) > 0 else ""
+        
+        # Get context from ContextManager with token limit to prevent overflow
+        context = context_manager.get_recent_context(max_chars=2000)  # Production stability
+        
+        # Build full prompt: recent context + original_prompt
+        if context.strip():
+            full_prompt = f"{context}\n\n---\n{original_prompt}"
+        else:
+            full_prompt = original_prompt
+        
+        # Log the full prompt being used
+        clog.log("info", f"[PROMPT] Original prompt: {original_prompt[:100]}...")
+        clog.log("info", f"[PROMPT] Context size: {context_manager.get_history_size()} utterances (limited to 2000 chars)")
+        clog.log("info", f"[PROMPT] Full prompt length: {len(full_prompt)} chars")
+        
+        # Tokenize the full prompt (with context injected)
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(full_prompt)) if len(full_prompt) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
@@ -203,12 +254,46 @@ class ServerState:
 
         async def opus_loop():
             all_pcm_data = None
+            # Buffer to accumulate model text responses
+            accumulated_model_response = ""
+            # Audio throttling: 100ms between AWS sends (production stability)
+            last_send_time = 0
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
+                
+                # SEND to persistent AWS stream with throttling (prevent API rate limits)
+                if pcm.shape[-1] > 0:
+                    try:
+                        # Convert float PCM → int16
+                        pcm_int16 = (pcm * 32767).astype(np.int16)
+                        
+                        # RESAMPLE if needed (Moshi is typically 24kHz, AWS needs 16kHz)
+                        if self.mimi.sample_rate != 16000:
+                            if RESAMPY_AVAILABLE:
+                                pcm_16k = resampy.resample(
+                                    pcm_int16.astype(np.float32),
+                                    self.mimi.sample_rate,
+                                    16000
+                                ).astype(np.int16)
+                            else:
+                                # Fallback: simple decimation if resampy not available
+                                ratio = self.mimi.sample_rate // 16000
+                                pcm_16k = pcm_int16[::ratio]
+                        else:
+                            pcm_16k = pcm_int16
+                        
+                        # Audio throttling: Send to AWS only every 100ms (very important for stability)
+                        now = time.time()
+                        if now - last_send_time > 0.1:  # 100ms throttle
+                            await aws_transcriber.send_audio(pcm_16k.tobytes())
+                            last_send_time = now
+                    except Exception as e:
+                        clog.log("error", f"[ERROR] Sending audio to AWS failed: {e}")
+                
                 if pcm.shape[-1] == 0:
                     continue
                 if all_pcm_data is None:
@@ -238,7 +323,20 @@ class ServerState:
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
                             await ws.send_bytes(msg)
-                        else:
+                            
+                            # ACCUMULATE MODEL RESPONSE for context storage
+                            accumulated_model_response += _text
+                            
+                        elif text_token == 3:  # EOS token (end of sentence)
+                            # Store complete model response in context
+                            if accumulated_model_response.strip():
+                                context_manager.update_transcript({
+                                    "speaker": "Moshi",
+                                    "text": accumulated_model_response.strip(),
+                                    "is_final": True
+                                })
+                                clog.log("info", f"[MODEL] Response stored: {accumulated_model_response.strip()[:100]}...")
+                                accumulated_model_response = ""
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
         async def send_loop():
@@ -306,6 +404,11 @@ class ServerState:
                 clog.log("info", "session closed")
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
         clog.log("info", "done with connection")
+        
+        # Cleanup persistent AWS stream
+        await aws_transcriber.stop()
+        clog.log("info", "AWS transcriber stopped")
+        
         return ws
 
 
