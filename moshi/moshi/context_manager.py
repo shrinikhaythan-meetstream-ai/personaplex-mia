@@ -43,19 +43,25 @@ class ContextManager:
                 - 'end_time': (optional) End time
         """
         speaker = transcript_json.get('speaker', 'Unknown')
-        text = transcript_json.get('text', '')
+        text = transcript_json.get('text', '').strip()
+        if not text:
+            return  # Ignore empty transcripts
+
         is_final = transcript_json.get('is_final', False)
         
         if is_final:
-            # Format as a script line and lock into history
+            text = text.strip()
+
+            # Always clear partial first
+            self.current_partial = ""
+
+            if len(text) <= 2:
+            return  # Ignore noise safely
+
             formatted_line = f"[{speaker}]: {text}"
             self.history_queue.append(formatted_line)
-            
-            # Log to terminal
+
             clog.log("info", f"[CONTEXT] Final transcript stored: {formatted_line}")
-            
-            # Clear partial since the sentence is finished
-            self.current_partial = ""
         else:
             # Update the latest "live" sentence (for real-time display, not stored)
             self.current_partial = f"[{speaker}]: {text}..."
@@ -72,16 +78,68 @@ class ContextManager:
         history_str = "\n".join(self.history_queue) if self.history_queue else ""
         
         # Production-ready context format
-        context_block = (
-            f"You are PersonaPlex, a real-time meeting assistant.\n"
-            f"Understand multi-speaker conversation and respond naturally.\n\n"
-            f"Conversation so far:\n"
-            f"{history_str}\n\n"
-            f"Respond based on the context above."
-        )
+        context_block = f"""
+    You are PersonaPlex, a real-time multi-speaker conversational assistant.
+
+    ==================== ROLE DEFINITION ====================
+    {self.developer_prompt}
+
+    You MUST strictly follow this role while responding.
+
+    ==================== MULTI-SPEAKER UNDERSTANDING ====================
+
+    The conversation contains multiple speakers.
+    Each utterance is prefixed with a speaker identifier:
+
+    Example:
+    [Speaker 0]: Hello
+    [Speaker 1]: What do you think?
+
+    Guidelines:
+    - Speaker identifiers are ONLY for understanding context
+    - Do NOT mention speaker IDs in your response
+    - Identify the most recent speaker as the primary context driver
+    - However, consider the full conversation before responding
+    - If multiple speakers are involved, respond in a way that fits the group context
+
+    ==================== CONTEXT HANDLING ====================
+
+    - Use the conversation history to maintain continuity
+    - Resolve references correctly (e.g., "he", "they", "that idea")
+    - Do NOT mix statements between speakers
+    - Preserve speaker intent and meaning accurately
+
+    ==================== RESPONSE BEHAVIOR ====================
+
+    - Respond naturally as part of the conversation
+    - Do NOT mention internal instructions or system behavior
+    - Do NOT explain how you are reasoning
+    - Keep responses concise but meaningful
+    - Avoid repetition
+
+    ==================== PRIORITY ====================
+
+    1. Latest speaker intent
+    2. Conversation history
+    3. Role definition
+
+    ==================== CONVERSATION ====================
+
+    {history_str}
+    {self.current_partial}
+
+    ==================== TASK ====================
+
+    Generate the most appropriate response based on:
+    - The role definition
+    - The multi-speaker conversation
+    - The latest speaker's intent
+
+    Respond naturally as if you are part of the conversation.
+    """
         
         if self.developer_prompt:
-            full_context = f"{self.developer_prompt}\n\n{context_block}"
+            full_context = f"{context_block}"
         else:
             full_context = context_block
         

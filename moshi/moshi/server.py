@@ -163,8 +163,11 @@ class ServerState:
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
 
-        # Initialize ContextManager for this session
-        context_manager = ContextManager(developer_prompt="", max_history=15)
+        # Get original prompt from request
+        original_prompt = request.query["text_prompt"] if len(request.query["text_prompt"]) > 0 else ""
+        
+        # Initialize ContextManager for this session with developer prompt
+        context_manager = ContextManager(developer_prompt=original_prompt, max_history=15)
         clog.log("info", "[INIT] ContextManager initialized for this session")
         
         # Initialize single persistent AWS Transcriber for this session
@@ -200,24 +203,15 @@ class ServerState:
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
         
-        # Get original prompt from request
-        original_prompt = request.query["text_prompt"] if len(request.query["text_prompt"]) > 0 else ""
-        
-        # Get context from ContextManager with token limit to prevent overflow
-        context = context_manager.get_recent_context(max_chars=2000)  # Production stability
-        
-        # Build full prompt: recent context + original_prompt
-        if context.strip():
-            full_prompt = f"{context}\n\n---\n{original_prompt}"
-        else:
-            full_prompt = original_prompt
+        # Get full prompt from ContextManager (includes role definition, instructions, and conversation history)
+        full_prompt = context_manager.get_full_prompt()
         
         # Log the full prompt being used
-        clog.log("info", f"[PROMPT] Original prompt: {original_prompt[:100]}...")
-        clog.log("info", f"[PROMPT] Context size: {context_manager.get_history_size()} utterances (limited to 2000 chars)")
+        clog.log("info", f"[PROMPT] System prompt: {original_prompt[:100]}...")
+        clog.log("info", f"[PROMPT] Context size: {context_manager.get_history_size()} utterances")
         clog.log("info", f"[PROMPT] Full prompt length: {len(full_prompt)} chars")
         
-        # Tokenize the full prompt (with context injected)
+        # Tokenize the full prompt directly from ContextManager
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(full_prompt)) if len(full_prompt) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
