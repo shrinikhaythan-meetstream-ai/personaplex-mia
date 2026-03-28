@@ -56,7 +56,9 @@ class ContextManager:
             self.current_partial = ""
 
             if len(text) <= 2:
-            return  # Ignore noise safely
+                return 
+
+             # Ignore noise safely
 
             formatted_line = f"[{speaker}]: {text}"
             self.history_queue.append(formatted_line)
@@ -139,7 +141,7 @@ class ContextManager:
     """
         
         if self.developer_prompt:
-            full_context = f"{context_block}"
+            full_context = context_block
         else:
             full_context = context_block
         
@@ -169,8 +171,9 @@ class ContextManager:
         if len(full_history) <= max_chars:
             return full_history
         # Return last N characters to keep recent context
-        return full_history[-max_chars:]
-    
+        #return full_history[-max_chars:]
+        return full_history
+
     def clear_context(self) -> None:
         """Clear all stored history and partials."""
         self.history_queue.clear()
