@@ -56,9 +56,7 @@ class ContextManager:
             self.current_partial = ""
 
             if len(text) <= 2:
-                return 
-
-             # Ignore noise safely
+                return  # Ignore noise safely
 
             formatted_line = f"[{speaker}]: {text}"
             self.history_queue.append(formatted_line)
