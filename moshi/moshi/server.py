@@ -239,6 +239,42 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:  # audio
                         payload = message[1:]
+                        # TAP USER AUDIO HERE (CRITICAL: before any model processing)
+                        # Send incoming WebSocket audio to AWS IMMEDIATELY
+                        nonlocal last_aws_send_time
+                        try:
+                            # Decode incoming Opus (USER AUDIO ONLY)
+                            incoming_audio_decoder.append_bytes(payload)
+                            user_pcm = incoming_audio_decoder.read_pcm()
+                            
+                            if user_pcm.shape[-1] > 0:
+                                # Convert float PCM → int16
+                                user_pcm_int16 = (user_pcm * 32767).astype(np.int16)
+                                
+                                # RESAMPLE to 16kHz for AWS (important: Moshi is 24kHz)
+                                if self.mimi.sample_rate != 16000:
+                                    if RESAMPY_AVAILABLE:
+                                        user_pcm_16k = resampy.resample(
+                                            user_pcm_int16.astype(np.float32),
+                                            self.mimi.sample_rate,
+                                            16000
+                                        ).astype(np.int16)
+                                    else:
+                                        ratio = self.mimi.sample_rate // 16000
+                                        user_pcm_16k = user_pcm_int16[::ratio]
+                                else:
+                                    user_pcm_16k = user_pcm_int16
+                                
+                                # Throttle AWS calls (100ms between sends)
+                                now = time.time()
+                                if now - last_aws_send_time > 0.1:
+                                    await aws_transcriber.send_audio(user_pcm_16k.tobytes())
+                                    last_aws_send_time = now
+                                    clog.log("debug", "[AWS] Sending USER audio chunk (from WebSocket): isolated from model output")
+                        except Exception as e:
+                            clog.log("error", f"[ERROR] Processing incoming audio for AWS failed: {e}")
+                        
+                        # ALSO add to shared opus_reader for model processing (unchanged pipeline)
                         opus_reader.append_bytes(payload)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
@@ -250,43 +286,12 @@ class ServerState:
             all_pcm_data = None
             # Buffer to accumulate model text responses
             accumulated_model_response = ""
-            # Audio throttling: 100ms between AWS sends (production stability)
-            last_send_time = 0
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
-                
-                # SEND to persistent AWS stream with throttling (prevent API rate limits)
-                if pcm.shape[-1] > 0:
-                    try:
-                        # Convert float PCM → int16
-                        pcm_int16 = (pcm * 32767).astype(np.int16)
-                        
-                        # RESAMPLE if needed (Moshi is typically 24kHz, AWS needs 16kHz)
-                        if self.mimi.sample_rate != 16000:
-                            if RESAMPY_AVAILABLE:
-                                pcm_16k = resampy.resample(
-                                    pcm_int16.astype(np.float32),
-                                    self.mimi.sample_rate,
-                                    16000
-                                ).astype(np.int16)
-                            else:
-                                # Fallback: simple decimation if resampy not available
-                                ratio = self.mimi.sample_rate // 16000
-                                pcm_16k = pcm_int16[::ratio]
-                        else:
-                            pcm_16k = pcm_int16
-                        
-                        # Audio throttling: Send to AWS only every 100ms (very important for stability)
-                        now = time.time()
-                        if now - last_send_time > 0.1:  # 100ms throttle
-                            await aws_transcriber.send_audio(pcm_16k.tobytes())
-                            last_send_time = now
-                    except Exception as e:
-                        clog.log("error", f"[ERROR] Sending audio to AWS failed: {e}")
                 
                 if pcm.shape[-1] == 0:
                     continue
@@ -354,6 +359,10 @@ class ServerState:
 
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+            # SEPARATE Opus decoder for incoming WebSocket audio (USER AUDIO ONLY for AWS)
+            incoming_audio_decoder = sphn.OpusStreamReader(self.mimi.sample_rate)
+            # Throttling for AWS (100ms between sends)
+            last_aws_send_time = 0
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
