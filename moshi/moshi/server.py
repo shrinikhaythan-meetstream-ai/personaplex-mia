@@ -216,7 +216,7 @@ class ServerState:
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
-            nonlocal close
+            nonlocal close, is_receiving_audio
             try:
                 async for message in ws:
                     if message.type == aiohttp.WSMsgType.ERROR:
@@ -240,7 +240,6 @@ class ServerState:
                     if kind == 1:  # audio
                         payload = message[1:]
                         # Mark this as USER audio frame from WebSocket
-                        nonlocal is_receiving_audio
                         is_receiving_audio = True
                         opus_reader.append_bytes(payload)
                     else:
@@ -250,6 +249,7 @@ class ServerState:
                 clog.log("info", "connection closed")
 
         async def opus_loop():
+            nonlocal is_receiving_audio, last_aws_send_time
             all_pcm_data = None
             # Buffer to accumulate model text responses
             accumulated_model_response = ""
@@ -290,7 +290,6 @@ class ServerState:
                                 pcm_16k = pcm_int16
                             
                             # Throttle AWS calls (100ms between sends)
-                            nonlocal last_aws_send_time
                             now = time.time()
                             if now - last_aws_send_time > 0.1:
                                 await aws_transcriber.send_audio(pcm_16k.tobytes())
