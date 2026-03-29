@@ -38,7 +38,7 @@ class AWSHandler(TranscriptResultStreamHandler):
         """Process transcript events from AWS Transcribe stream with error handling."""
         try:
             results = transcript_event.transcript.results
-            clog.log("debug", f"[AWS] Received {len(results)} results from AWS")
+            clog.log("info", f"[AWS] Received {len(results)} results from AWS")
             
             for result in results:
                 # Process BOTH partial and final transcripts
@@ -199,12 +199,12 @@ class AWSTranscriber:
                     silence_frame = np.zeros(160, dtype=np.int16).tobytes()
                     try:
                         await self.stream.input_stream.send_audio_event(audio_chunk=silence_frame)
-                        clog.log("debug", "[AWS] Keepalive: sent silence frame to keep stream alive")
+                        clog.log("info", "[AWS] Keepalive: sent silence frame to keep stream alive")
                     except Exception as e:
-                        clog.log("debug", f"[AWS] Keepalive failed (stream may have closed): {e}")
+                        clog.log("info", f"[AWS] Keepalive failed (stream may have closed): {e}")
                         break
         except asyncio.CancelledError:
-            clog.log("debug", "[AWS] Keepalive loop cancelled")
+            clog.log("info", "[AWS] Keepalive loop cancelled")
         except Exception as e:
             clog.log("error", f"[AWS] Keepalive loop error: {e}")
     
