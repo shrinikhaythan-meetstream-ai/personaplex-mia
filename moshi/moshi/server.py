@@ -170,10 +170,9 @@ class ServerState:
         context_manager = ContextManager(developer_prompt=original_prompt, max_history=15)
         clog.log("info", "[INIT] ContextManager initialized for this session")
         
-        # Initialize single persistent AWS Transcriber for this session
+        # Initialize single persistent AWS Transcriber for this session (lazy start)
         aws_transcriber = AWSTranscriber(context_manager)
-        await aws_transcriber.start()
-        clog.log("info", "[INIT] AWS Transcriber started (single persistent stream)")
+        clog.log("info", "[INIT] AWS Transcriber created (lazy start - will start on first audio)")
 
         # self.lm_gen.temp = float(request.query["audio_temperature"])
         # self.lm_gen.temp_text = float(request.query["text_temperature"])
@@ -249,7 +248,7 @@ class ServerState:
                 clog.log("info", "connection closed")
 
         async def opus_loop():
-            nonlocal is_receiving_audio, last_aws_send_time
+            nonlocal is_receiving_audio, last_aws_send_time, aws_started, aws_alive
             all_pcm_data = None
             # Buffer to accumulate model text responses
             accumulated_model_response = ""
@@ -268,9 +267,20 @@ class ServerState:
                         pcm_max = np.max(np.abs(pcm))
                         
                         # Only process REAL user audio: must originate from recv_loop AND have sufficient energy
-                        # Energy threshold (0.02) filters silence + model artifacts
-                        if is_receiving_audio and pcm_max > 0.02:
+                        # Energy threshold (0.01) filters silence + model artifacts
+                        if is_receiving_audio and pcm_max > 0.01:
                             clog.log("info", f"[AWS AUDIO] PCM max: {pcm_max:.4f} (user voice)")
+                            
+                            # LAZY START: Start AWS on first valid audio chunk (avoid 15s timeout)
+                            if not aws_started:
+                                try:
+                                    await aws_transcriber.start()
+                                    aws_started = True
+                                    aws_alive = True
+                                    clog.log("info", "[AWS] Started on first audio (lazy start)")
+                                except Exception as e:
+                                    clog.log("error", f"[ERROR] Failed to start AWS on first audio: {e}")
+                                    aws_alive = False
                             
                             # Convert float PCM → int16
                             pcm_int16 = (pcm * 32767).astype(np.int16)
@@ -289,17 +299,32 @@ class ServerState:
                             else:
                                 pcm_16k = pcm_int16
                             
-                            # Throttle AWS calls (100ms between sends)
-                            now = time.time()
-                            if now - last_aws_send_time > 0.1:
-                                await aws_transcriber.send_audio(pcm_16k.tobytes())
-                                last_aws_send_time = now
-                                clog.log("info", "[AWS] Sent USER audio chunk (filtered, clean)")
+                            # Throttle AWS calls (100ms between sends) - only if AWS is alive
+                            if aws_alive:
+                                now = time.time()
+                                if now - last_aws_send_time > 0.1:
+                                    try:
+                                        await aws_transcriber.send_audio(pcm_16k.tobytes())
+                                        last_aws_send_time = now
+                                        clog.log("info", "[AWS] Sent audio chunk")
+                                    except Exception as send_error:
+                                        clog.log("error", f"[AWS ERROR] Send failed: {send_error}")
+                                        aws_alive = False
+                                        # Attempt recovery: restart AWS
+                                        try:
+                                            clog.log("info", "[AWS] Attempting to restart after failure...")
+                                            await aws_transcriber.stop()
+                                            await asyncio.sleep(0.5)  # Brief pause before restart
+                                            await aws_transcriber.start()
+                                            aws_alive = True
+                                            clog.log("info", "[AWS] Restarted successfully")
+                                        except Exception as restart_error:
+                                            clog.log("error", f"[AWS ERROR] Restart failed: {restart_error}")
                         
                         # Reset flag AFTER processing (mark only one reading per frame)
                         is_receiving_audio = False
                     except Exception as e:
-                        clog.log("error", f"[ERROR] AWS audio send failed: {e}")
+                        clog.log("error", f"[ERROR] AWS pipeline failed: {e}")
                 
                 if pcm.shape[-1] == 0:
                     continue
@@ -371,6 +396,9 @@ class ServerState:
             last_aws_send_time = 0
             # Direction-aware audio filtering: mark user-origin frames
             is_receiving_audio = False
+            # Lazy-start AWS: only start when first valid audio arrives
+            aws_started = False
+            aws_alive = True
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
@@ -416,9 +444,13 @@ class ServerState:
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
         clog.log("info", "done with connection")
         
-        # Cleanup persistent AWS stream
-        await aws_transcriber.stop()
-        clog.log("info", "AWS transcriber stopped")
+        # Cleanup persistent AWS stream (only if it was started)
+        if aws_started:
+            try:
+                await aws_transcriber.stop()
+                clog.log("info", "[AWS] Transcriber stopped")
+            except Exception as e:
+                clog.log("error", f"[ERROR] Failed to stop AWS transcriber: {e}")
         
         return ws
 
