@@ -270,7 +270,7 @@ class ServerState:
                                 if now - last_aws_send_time > 0.1:
                                     await aws_transcriber.send_audio(user_pcm_16k.tobytes())
                                     last_aws_send_time = now
-                                    clog.log("debug", "[AWS] Sending USER audio chunk (from WebSocket): isolated from model output")
+                                    clog.log("info", "[AWS] Sending USER audio chunk (from WebSocket): isolated from model output")
                         except Exception as e:
                             clog.log("error", f"[ERROR] Processing incoming audio for AWS failed: {e}")
                         
