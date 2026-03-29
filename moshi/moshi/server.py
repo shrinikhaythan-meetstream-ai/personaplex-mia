@@ -246,6 +246,7 @@ class ServerState:
                             # Decode incoming Opus (USER AUDIO ONLY)
                             incoming_audio_decoder.append_bytes(payload)
                             user_pcm = incoming_audio_decoder.read_pcm()
+                            print(f"[DEBUG]Decoded incoming audio PCM shape: {user_pcm.mean()}")
                             
                             if user_pcm.shape[-1] > 0:
                                 # Convert float PCM → int16
