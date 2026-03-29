@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import time
 from typing import Optional
 import numpy as np
 
@@ -37,10 +38,12 @@ class AWSHandler(TranscriptResultStreamHandler):
         """Process transcript events from AWS Transcribe stream with error handling."""
         try:
             results = transcript_event.transcript.results
+            clog.log("debug", f"[AWS] Received {len(results)} results from AWS")
+            
             for result in results:
-                # Process only FINAL transcripts (skip partials)
-                if result.is_partial:
-                    continue
+                # Process BOTH partial and final transcripts
+                transcript_text = ""
+                is_partial = result.is_partial
                 
                 if not result.alternatives:
                     continue
@@ -48,23 +51,25 @@ class AWSHandler(TranscriptResultStreamHandler):
                 alt = result.alternatives[0]
                 transcript_text = alt.transcript.strip()
                 
+                if not transcript_text:
+                    continue
+                
                 # FIX: Reliable speaker detection with proper null checking
-                speaker_label = "Unknown"
-                if hasattr(alt, 'items') and alt.items and len(alt.items) > 0:
-                    speaker_attr = getattr(alt.items[0], "speaker", None)
-                    if speaker_attr is not None:
-                        speaker_label = str(speaker_attr)
+                speaker_label = "Speaker 0"
+                if hasattr(result, 'speaker_label') and result.speaker_label is not None:
+                    speaker_label = f"Speaker {result.speaker_label}"
                 
-                speaker = f"Speaker {speaker_label}" if speaker_label != "Unknown" else "Unknown"
+                log_type = "PARTIAL" if is_partial else "FINAL"
+                clog.log("info", f"[AWS] {log_type} transcript: {speaker_label}: {transcript_text}")
                 
-                clog.log("info", f"[AWS] Final transcript: {speaker}: {transcript_text}")
-                
-                # Auto-store in context
-                self.context_manager.update_transcript({
-                    "speaker": speaker,
-                    "text": transcript_text,
-                    "is_final": True
-                })
+                # Only store FINAL transcripts to context
+                if not is_partial:
+                    self.context_manager.update_transcript({
+                        "speaker": speaker_label,
+                        "text": transcript_text,
+                        "is_final": True
+                    })
+                    clog.log("info", f"[AWS TRANSCRIPT STORED] {speaker_label}: {transcript_text}")
                 
         except Exception as e:
             clog.log("error", f"[AWS ERROR] Failed to process transcript: {str(e)}")
@@ -89,6 +94,8 @@ class AWSTranscriber:
         self.client = TranscribeStreamingClient(region=AWS_REGION)
         self.stream = None
         self.enabled = True
+        self.last_audio_time = 0  # Track last audio chunk for keepalive
+        self.keepalive_task = None  # Task for sending silence keepalive
         clog.log("info", "[AWS] AWSTranscriber initialized (single persistent stream mode)")
     
     async def start(self) -> None:
@@ -117,7 +124,10 @@ class AWSTranscriber:
             # Start receive loop in background (runs for entire connection)
             asyncio.create_task(self._receive_loop())
             
-            clog.log("info", "[AWS] Persistent stream created and listening")
+            # Start keepalive task (sends silence to keep stream alive)
+            self.keepalive_task = asyncio.create_task(self._keepalive_loop())
+            
+            clog.log("info", "[AWS] Persistent stream created and listening with keepalive")
             
         except Exception as e:
             clog.log("error", f"[AWS] Failed to start stream: {e}")
@@ -136,6 +146,8 @@ class AWSTranscriber:
             return
         
         try:
+            import time
+            self.last_audio_time = time.time()  # Track for keepalive
             await self.stream.input_stream.send_audio_event(audio_chunk=pcm_bytes)
         except asyncio.CancelledError:
             pass
@@ -154,7 +166,9 @@ class AWSTranscriber:
         
         try:
             handler = AWSHandler(self.stream.output_stream, self.context_manager)
+            clog.log("info", "[AWS] Starting event handler for persistent stream")
             await handler.handle_events()
+            clog.log("info", "[AWS] Event handler completed")
         except asyncio.CancelledError:
             clog.log("info", "[AWS] Receive loop cancelled")
             pass
@@ -163,8 +177,47 @@ class AWSTranscriber:
         finally:
             clog.log("info", "[AWS] Persistent stream closed")
     
+    async def _keepalive_loop(self) -> None:
+        """
+        Send silence frames every 5 seconds to keep AWS stream alive.
+        
+        AWS closes connections after ~15s of no audio.
+        This keepalive prevents timeout by sending silence periodically.
+        """
+        if not self.stream:
+            return
+        
+        try:
+            import time as time_module
+            while self.stream and self.enabled:
+                await asyncio.sleep(5)  # Every 5 seconds
+                
+                # Check if we haven't sent real audio in last 10 seconds
+                time_since_last_audio = time_module.time() - self.last_audio_time
+                if time_since_last_audio > 8:  # If idle for 8+ seconds
+                    # Send silence frame (1/100th of a second at 16kHz = 160 bytes of silence)
+                    silence_frame = np.zeros(160, dtype=np.int16).tobytes()
+                    try:
+                        await self.stream.input_stream.send_audio_event(audio_chunk=silence_frame)
+                        clog.log("debug", "[AWS] Keepalive: sent silence frame to keep stream alive")
+                    except Exception as e:
+                        clog.log("debug", f"[AWS] Keepalive failed (stream may have closed): {e}")
+                        break
+        except asyncio.CancelledError:
+            clog.log("debug", "[AWS] Keepalive loop cancelled")
+        except Exception as e:
+            clog.log("error", f"[AWS] Keepalive loop error: {e}")
+    
     async def stop(self) -> None:
         """Close persistent stream (called on connection close)."""
+        # Cancel keepalive task
+        if self.keepalive_task:
+            self.keepalive_task.cancel()
+            try:
+                await self.keepalive_task
+            except asyncio.CancelledError:
+                pass
+        
         if self.stream:
             try:
                 await self.stream.input_stream.end_stream()
