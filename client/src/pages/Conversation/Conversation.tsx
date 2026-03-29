@@ -76,7 +76,7 @@ const buildURL = ({
 };
 
 
-export const Conversation:FC<ConversationProps> = ({
+export const Conversation: FC<ConversationProps> = ({
   workerAddr,
   workerAuthId,
   audioContext,
@@ -85,11 +85,11 @@ export const Conversation:FC<ConversationProps> = ({
   sessionId,
   onConversationEnd,
   startConnection,
-  isBypass=false,
+  isBypass = false,
   email,
   theme,
   ...params
-}) => {
+}: ConversationProps) => {
   const getAudioStats = useRef<() => AudioStats>(() => ({
     playedAudioDuration: 0,
     missedAudioDuration: 0,
@@ -134,7 +134,7 @@ export const Conversation:FC<ConversationProps> = ({
     onDisconnect,
   });
   useEffect(() => {
-    audioRecorder.current.ondataavailable = (e) => {
+    audioRecorder.current.ondataavailable = (e: BlobEvent) => {
       audioChunks.current.push(e.data);
     };
     audioRecorder.current.onstop = async () => {
