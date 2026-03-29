@@ -239,43 +239,9 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:  # audio
                         payload = message[1:]
-                        # TAP USER AUDIO HERE (CRITICAL: before any model processing)
-                        # Send incoming WebSocket audio to AWS IMMEDIATELY
-                        nonlocal last_aws_send_time
-                        try:
-                            # Decode incoming Opus (USER AUDIO ONLY)
-                            incoming_audio_decoder.append_bytes(payload)
-                            user_pcm = incoming_audio_decoder.read_pcm()
-                            print(f"[DEBUG]Decoded incoming audio PCM shape: {user_pcm.mean()}")
-                            
-                            if user_pcm.shape[-1] > 0:
-                                # Convert float PCM → int16
-                                user_pcm_int16 = (user_pcm * 32767).astype(np.int16)
-                                
-                                # RESAMPLE to 16kHz for AWS (important: Moshi is 24kHz)
-                                if self.mimi.sample_rate != 16000:
-                                    if RESAMPY_AVAILABLE:
-                                        user_pcm_16k = resampy.resample(
-                                            user_pcm_int16.astype(np.float32),
-                                            self.mimi.sample_rate,
-                                            16000
-                                        ).astype(np.int16)
-                                    else:
-                                        ratio = self.mimi.sample_rate // 16000
-                                        user_pcm_16k = user_pcm_int16[::ratio]
-                                else:
-                                    user_pcm_16k = user_pcm_int16
-                                
-                                # Throttle AWS calls (100ms between sends)
-                                now = time.time()
-                                if now - last_aws_send_time > 0.1:
-                                    await aws_transcriber.send_audio(user_pcm_16k.tobytes())
-                                    last_aws_send_time = now
-                                    clog.log("info", "[AWS] Sending USER audio chunk (from WebSocket): isolated from model output")
-                        except Exception as e:
-                            clog.log("error", f"[ERROR] Processing incoming audio for AWS failed: {e}")
-                        
-                        # ALSO add to shared opus_reader for model processing (unchanged pipeline)
+                        # Mark this as USER audio frame from WebSocket
+                        nonlocal is_receiving_audio
+                        is_receiving_audio = True
                         opus_reader.append_bytes(payload)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
@@ -293,6 +259,48 @@ class ServerState:
                     return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
+                
+                # TAP AWS AUDIO HERE: Send user microphone audio to AWS Transcriber
+                # Using opus_reader ensures correct synchronized decoding (not parallel)
+                if pcm.shape[-1] > 0:
+                    try:
+                        # Compute PCM energy
+                        pcm_max = np.max(np.abs(pcm))
+                        
+                        # Only process REAL user audio: must originate from recv_loop AND have sufficient energy
+                        # Energy threshold (0.02) filters silence + model artifacts
+                        if is_receiving_audio and pcm_max > 0.02:
+                            clog.log("info", f"[AWS AUDIO] PCM max: {pcm_max:.4f} (user voice)")
+                            
+                            # Convert float PCM → int16
+                            pcm_int16 = (pcm * 32767).astype(np.int16)
+                            
+                            # Resample to 16kHz for AWS
+                            if self.mimi.sample_rate != 16000:
+                                if RESAMPY_AVAILABLE:
+                                    pcm_16k = resampy.resample(
+                                        pcm_int16.astype(np.float32),
+                                        self.mimi.sample_rate,
+                                        16000
+                                    ).astype(np.int16)
+                                else:
+                                    ratio = self.mimi.sample_rate // 16000
+                                    pcm_16k = pcm_int16[::ratio]
+                            else:
+                                pcm_16k = pcm_int16
+                            
+                            # Throttle AWS calls (100ms between sends)
+                            nonlocal last_aws_send_time
+                            now = time.time()
+                            if now - last_aws_send_time > 0.1:
+                                await aws_transcriber.send_audio(pcm_16k.tobytes())
+                                last_aws_send_time = now
+                                clog.log("info", "[AWS] Sent USER audio chunk (filtered, clean)")
+                        
+                        # Reset flag AFTER processing (mark only one reading per frame)
+                        is_receiving_audio = False
+                    except Exception as e:
+                        clog.log("error", f"[ERROR] AWS audio send failed: {e}")
                 
                 if pcm.shape[-1] == 0:
                     continue
@@ -360,10 +368,10 @@ class ServerState:
 
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
-            # SEPARATE Opus decoder for incoming WebSocket audio (USER AUDIO ONLY for AWS)
-            incoming_audio_decoder = sphn.OpusStreamReader(self.mimi.sample_rate)
             # Throttling for AWS (100ms between sends)
             last_aws_send_time = 0
+            # Direction-aware audio filtering: mark user-origin frames
+            is_receiving_audio = False
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
