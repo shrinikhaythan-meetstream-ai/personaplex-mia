@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import time
@@ -28,7 +27,10 @@ class DeepgramTranscriber:
         if not api_key:
             raise EnvironmentError("DEEPGRAM_API_KEY environment variable not set.")
         self.context_manager = context_manager
+        
+        # Uses DEEPGRAM_API_KEY from environment variables automatically
         self.client = DeepgramClient()
+        
         self.model = model
         self.language = language
         self.punctuate = punctuate
@@ -61,11 +63,17 @@ class DeepgramTranscriber:
                 smart_format=self.smart_format,
                 interim_results=self.interim_results,
                 diarize=self.diarize,
+                encoding="linear16",   # Required for raw PCM
+                sample_rate=16000,     # Required for raw PCM
+                channels=1             # Required for raw PCM
             )
-            self.connection.on(EventType.OPEN, lambda _: clog.log("info", "[Deepgram] Connection opened"))
-            self.connection.on(EventType.CLOSE, lambda _: clog.log("info", "[Deepgram] Connection closed"))
-            self.connection.on(EventType.ERROR, lambda err: clog.log("error", f"[Deepgram ERROR] {err}"))
+            
+            # Safe lambda signatures with **kwargs to prevent crashes
+            self.connection.on(EventType.OPEN, lambda _, **kwargs: clog.log("info", "[Deepgram] Connection opened"))
+            self.connection.on(EventType.CLOSE, lambda _, **kwargs: clog.log("info", "[Deepgram] Connection closed"))
+            self.connection.on(EventType.ERROR, lambda _, err, **kwargs: clog.log("error", f"[Deepgram ERROR] {err}"))
             self.connection.on(EventType.MESSAGE, self._on_message)
+            
             self.connection.start_listening()
             self.keepalive_task = asyncio.create_task(self._keepalive_loop())
             self.receive_task = asyncio.create_task(self._audio_send_loop())
@@ -97,30 +105,45 @@ class DeepgramTranscriber:
             except Exception as e:
                 clog.log("error", f"[Deepgram] Error sending audio: {e}")
 
-    def _on_message(self, message):
+    def _on_message(self, self_obj, message, **kwargs):
+        """
+        Correctly typed callback that processes results and cleanly separates speakers.
+        """
         if isinstance(message, ListenV1Results):
             words = message.channel.alternatives[0].words if message.channel else []
             is_final = getattr(message, 'is_final', False)
-            transcript_text = " ".join([w.word for w in words])
+            
+            if not words:
+                return
+
+            current_speaker = getattr(words[0], 'speaker', 0)
+            current_phrase = []
+
             for w in words:
-                speaker_label = f"Speaker {w.speaker}" if hasattr(w, 'speaker') else "Speaker 0"
-                log_type = "FINAL" if is_final else "PARTIAL"
-                clog.log("info", f"[Deepgram] {log_type} transcript: {speaker_label}: {w.word}")
-            if transcript_text:
-                # Only store FINAL transcripts to context
-                if is_final:
-                    self.context_manager.update_transcript({
-                        "speaker": speaker_label,
-                        "text": transcript_text,
-                        "is_final": True
-                    })
-                    clog.log("info", f"[DEEPGRAM TRANSCRIPT STORED] {speaker_label}: {transcript_text}")
+                spk = getattr(w, 'speaker', 0)
+                if spk == current_speaker:
+                    current_phrase.append(w.word)
                 else:
-                    self.context_manager.update_transcript({
-                        "speaker": speaker_label,
-                        "text": transcript_text,
-                        "is_final": False
-                    })
+                    self._flush_transcript(current_speaker, current_phrase, is_final)
+                    current_speaker = spk
+                    current_phrase = [w.word]
+            
+            if current_phrase:
+                self._flush_transcript(current_speaker, current_phrase, is_final)
+
+    def _flush_transcript(self, speaker_id, word_list, is_final):
+        """Helper to cleanly push transcripts to the context manager."""
+        transcript_text = " ".join(word_list)
+        speaker_label = f"Speaker {speaker_id}"
+        log_type = "FINAL" if is_final else "PARTIAL"
+        
+        clog.log("info", f"[Deepgram] {log_type} transcript: {speaker_label}: {transcript_text}")
+        
+        self.context_manager.update_transcript({
+            "speaker": speaker_label,
+            "text": transcript_text,
+            "is_final": is_final
+        })
 
     async def _keepalive_loop(self) -> None:
         """
@@ -130,7 +153,6 @@ class DeepgramTranscriber:
             await asyncio.sleep(5)
             try:
                 self.connection.send_keep_alive()
-                clog.log("info", "[Deepgram] Keepalive: sent keepalive to keep stream alive")
             except Exception as e:
                 clog.log("info", f"[Deepgram] Keepalive failed (stream may have closed): {e}")
                 break
