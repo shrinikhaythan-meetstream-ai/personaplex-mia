@@ -43,7 +43,6 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
 # Load .env file
 load_dotenv()
@@ -196,7 +195,7 @@ class ServerState:
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
-            nonlocal close, is_receiving_audio
+            nonlocal close, is_receiving_audio, deepgram_started
             try:
                 async for message in ws:
                     if message.type == aiohttp.WSMsgType.ERROR:
@@ -217,11 +216,52 @@ class ServerState:
                         clog.log("warning", "empty message")
                         continue
                     kind = message[0]
-                    if kind == 1:  # audio
+                    if kind == 1:  # audio from Browser (User Mic)
                         payload = message[1:]
-                        # Mark this as USER audio frame from WebSocket
                         is_receiving_audio = True
+                        
+                        # 1. Feed the model's decoder
                         opus_reader.append_bytes(payload)
+                        
+                        # 2. Feed Deepgram's isolated decoder
+                        deepgram_opus_reader.append_bytes(payload)
+                        pcm = deepgram_opus_reader.read_pcm()
+                        
+                        # Process and send to Deepgram immediately
+                        if pcm.shape[-1] > 0:
+                            pcm_max = np.max(np.abs(pcm))
+                            if pcm_max > 0.01:
+                                if not deepgram_started:
+                                    try:
+                                        await deepgram_transcriber.start()
+                                        deepgram_started = True
+                                        clog.log("info", "[Deepgram] Started on first audio (lazy start)")
+                                    except Exception as e:
+                                        clog.log("error", f"[ERROR] Failed to start Deepgram on first audio: {e}")
+                                
+                                # Convert float PCM → int16 (Creates the linear16 format)
+                                pcm_int16 = (pcm * 32767).astype(np.int16)
+                                
+                                # Resample to 16kHz for Deepgram
+                                if self.mimi.sample_rate != 16000:
+                                    if RESAMPY_AVAILABLE:
+                                        pcm_16k = resampy.resample(
+                                            pcm_int16.astype(np.float32),
+                                            self.mimi.sample_rate,
+                                            16000
+                                        ).astype(np.int16)
+                                    else:
+                                        ratio = self.mimi.sample_rate // 16000
+                                        pcm_16k = pcm_int16[::ratio]
+                                else:
+                                    pcm_16k = pcm_int16
+                                
+                                if deepgram_started:
+                                    try:
+                                        await deepgram_transcriber.send_audio(pcm_16k.tobytes())
+                                    except Exception as send_error:
+                                        clog.log("error", f"[Deepgram ERROR] Send failed: {send_error}")
+
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
@@ -229,7 +269,7 @@ class ServerState:
                 clog.log("info", "connection closed")
 
         async def opus_loop():
-            nonlocal is_receiving_audio, deepgram_started
+            nonlocal is_receiving_audio
             all_pcm_data = None
             # Buffer to accumulate model text responses
             accumulated_model_response = ""
@@ -238,54 +278,9 @@ class ServerState:
                 if close:
                     return
                 await asyncio.sleep(0.001)
-                pcm = opus_reader.read_pcm()
                 
-                # TAP DEEPGRAM AUDIO HERE: Send user microphone audio to Deepgram
-                if pcm.shape[-1] > 0:
-                    try:
-                        pcm_max = np.max(np.abs(pcm))
-                        
-                        # Only process REAL user audio
-                        if is_receiving_audio and pcm_max > 0.01:
-                            clog.log("info", f"[DEEPGRAM AUDIO] PCM max: {pcm_max:.4f} (user voice)")
-                            
-                            # LAZY START: Start Deepgram on first valid audio chunk
-                            if not deepgram_started:
-                                try:
-                                    await deepgram_transcriber.start()
-                                    deepgram_started = True
-                                    clog.log("info", "[Deepgram] Started on first audio (lazy start)")
-                                except Exception as e:
-                                    clog.log("error", f"[ERROR] Failed to start Deepgram on first audio: {e}")
-                            
-                            # Convert float PCM → int16
-                            pcm_int16 = (pcm * 32767).astype(np.int16)
-                            
-                            # Resample to 16kHz for Deepgram
-                            if self.mimi.sample_rate != 16000:
-                                if RESAMPY_AVAILABLE:
-                                    pcm_16k = resampy.resample(
-                                        pcm_int16.astype(np.float32),
-                                        self.mimi.sample_rate,
-                                        16000
-                                    ).astype(np.int16)
-                                else:
-                                    ratio = self.mimi.sample_rate // 16000
-                                    pcm_16k = pcm_int16[::ratio]
-                            else:
-                                pcm_16k = pcm_int16
-                            
-                            # Send audio seamlessly into the async queue
-                            if deepgram_started:
-                                try:
-                                    await deepgram_transcriber.send_audio(pcm_16k.tobytes())
-                                except Exception as send_error:
-                                    clog.log("error", f"[Deepgram ERROR] Send failed: {send_error}")
-                        
-                        # Reset flag AFTER processing
-                        is_receiving_audio = False
-                    except Exception as e:
-                        clog.log("error", f"[ERROR] Deepgram pipeline failed: {e}")
+                # The model reads its copy of the audio here
+                pcm = opus_reader.read_pcm()
                 
                 if pcm.shape[-1] == 0:
                     continue
@@ -293,6 +288,7 @@ class ServerState:
                     all_pcm_data = pcm
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
+                    
                 while all_pcm_data.shape[-1] >= self.frame_size:
                     be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
@@ -353,6 +349,9 @@ class ServerState:
 
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+            # NEW: Isolated decoder for Deepgram
+            deepgram_opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate) 
+            
             # Direction-aware audio filtering: mark user-origin frames
             is_receiving_audio = False
             # Lazy-start Deepgram
@@ -414,14 +413,7 @@ class ServerState:
 
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
-    """
-    If voice_prompt_dir is None:
-      - download voices.tgz from HF
-      - extract it once
-      - return extracted directory
-    If voice_prompt_dir is provided:
-      - just return it
-    """
+    # ... (unchanged)
     if voice_prompt_dir is not None:
         return voice_prompt_dir
 
@@ -443,6 +435,7 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
 
 
 def _get_static_path(static: Optional[str]) -> Optional[str]:
+    # ... (unchanged)
     if static is None:
         logger.info("retrieving the static content")
         dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
@@ -459,6 +452,7 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
 
 
 def main():
+    # ... (unchanged)
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
     parser.add_argument("--port", default=8998, type=int)
