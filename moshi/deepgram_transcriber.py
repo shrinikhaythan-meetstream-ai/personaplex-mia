@@ -28,7 +28,7 @@ class DeepgramTranscriber:
         if not api_key:
             raise EnvironmentError("DEEPGRAM_API_KEY environment variable not set.")
         self.context_manager = context_manager
-        self.client = DeepgramClient(api_key)
+        self.client = DeepgramClient()
         self.model = model
         self.language = language
         self.punctuate = punctuate
