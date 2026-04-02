@@ -65,7 +65,8 @@ from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 from .context_manager import ContextManager
-from .aws_transcriber import AWSTranscriber
+from .aws_transcriber import AWSTranscriber  # Legacy fallback
+from .deepgram_transcriber import DeepgramTranscriber
 
 try:
     import resampy
@@ -170,9 +171,11 @@ class ServerState:
         context_manager = ContextManager(developer_prompt=original_prompt, max_history=15)
         clog.log("info", "[INIT] ContextManager initialized for this session")
         
-        # Initialize single persistent AWS Transcriber for this session (lazy start)
-        aws_transcriber = AWSTranscriber(context_manager)
-        clog.log("info", "[INIT] AWS Transcriber created (lazy start - will start on first audio)")
+        # Initialize Deepgram Transcriber for this session
+        deepgram_transcriber = DeepgramTranscriber()
+        clog.log("info", "[INIT] Deepgram Transcriber created (will start on first audio)")
+        # aws_transcriber = AWSTranscriber(context_manager)  # Legacy fallback
+        # clog.log("info", "[INIT] AWS Transcriber created (lazy start - will start on first audio)")
 
         # self.lm_gen.temp = float(request.query["audio_temperature"])
         # self.lm_gen.temp_text = float(request.query["text_temperature"])
@@ -269,23 +272,10 @@ class ServerState:
                         # Only process REAL user audio: must originate from recv_loop AND have sufficient energy
                         # Energy threshold (0.01) filters silence + model artifacts
                         if is_receiving_audio and pcm_max > 0.01:
-                            clog.log("info", f"[AWS AUDIO] PCM max: {pcm_max:.4f} (user voice)")
-                            
-                            # LAZY START: Start AWS on first valid audio chunk (avoid 15s timeout)
-                            if not aws_started:
-                                try:
-                                    await aws_transcriber.start()
-                                    aws_started = True
-                                    aws_alive = True
-                                    clog.log("info", "[AWS] Started on first audio (lazy start)")
-                                except Exception as e:
-                                    clog.log("error", f"[ERROR] Failed to start AWS on first audio: {e}")
-                                    aws_alive = False
-                            
+                            clog.log("info", f"[AUDIO] PCM max: {pcm_max:.4f} (user voice)")
                             # Convert float PCM → int16
                             pcm_int16 = (pcm * 32767).astype(np.int16)
-                            
-                            # Resample to 16kHz for AWS
+                            # Resample to 16kHz for Deepgram
                             if self.mimi.sample_rate != 16000:
                                 if RESAMPY_AVAILABLE:
                                     pcm_16k = resampy.resample(
@@ -298,26 +288,54 @@ class ServerState:
                                     pcm_16k = pcm_int16[::ratio]
                             else:
                                 pcm_16k = pcm_int16
-                            
-                            # Throttle AWS calls (100ms between sends) - only if AWS is alive
-                            if aws_alive:
-                                now = time.time()
-                                if now - last_aws_send_time > 0.1:
-                                    try:
-                                        await aws_transcriber.send_audio(pcm_16k.tobytes())
-                                        last_aws_send_time = now
-                                        clog.log("info", "[AWS] Sent audio chunk")
-                                    except Exception as send_error:
-                                        clog.log("error", f"[AWS ERROR] Send failed: {send_error}")
-                                        aws_alive = False
-                                        # Attempt recovery: restart AWS
-                                        try:
-                                            clog.log("info", "[AWS] Attempting to restart after failure...")
-                                            await aws_transcriber.stop()
-                                            await asyncio.sleep(0.5)  # Brief pause before restart
-                                            await aws_transcriber.start()
-                                            aws_alive = True
-                                            clog.log("info", "[AWS] Restarted successfully")
+
+                            # Pipe audio to Deepgram transcriber
+                            if not hasattr(self, "_deepgram_stream"):
+                                # Start Deepgram stream generator
+                                def audio_gen():
+                                    yield pcm_16k.tobytes()
+                                self._deepgram_stream = deepgram_transcriber.stream(audio_gen())
+                            else:
+                                # Feed new chunk to generator
+                                def audio_gen():
+                                    yield pcm_16k.tobytes()
+                                self._deepgram_stream = deepgram_transcriber.stream(audio_gen())
+
+                            # Read results from Deepgram
+                            try:
+                                for result in self._deepgram_stream:
+                                    clog.log("info", f"[Deepgram] Speaker {result['speaker']}: {result['word']}")
+                                    # TODO: Route result to wherever AWS transcript was used
+                            except Exception as e:
+                                clog.log("error", f"[Deepgram ERROR] {e}")
+
+                            # --- Legacy AWS code below (fallback only) ---
+                            # if not aws_started:
+                            #     try:
+                            #         await aws_transcriber.start()
+                            #         aws_started = True
+                            #         aws_alive = True
+                            #         clog.log("info", "[AWS] Started on first audio (lazy start)")
+                            #     except Exception as e:
+                            #         clog.log("error", f"[ERROR] Failed to start AWS on first audio: {e}")
+                            #         aws_alive = False
+                            # if aws_alive:
+                            #     now = time.time()
+                            #     if now - last_aws_send_time > 0.1:
+                            #         try:
+                            #             await aws_transcriber.send_audio(pcm_16k.tobytes())
+                            #             last_aws_send_time = now
+                            #             clog.log("info", "[AWS] Sent audio chunk")
+                            #         except Exception as send_error:
+                            #             clog.log("error", f"[AWS ERROR] Send failed: {send_error}")
+                            #             aws_alive = False
+                            #             try:
+                            #                 clog.log("info", "[AWS] Attempting to restart after failure...")
+                            #                 await aws_transcriber.stop()
+                            #                 await asyncio.sleep(0.5)
+                            #                 await aws_transcriber.start()
+                            #                 aws_alive = True
+                            #                 clog.log("info", "[AWS] Restarted successfully")
                                         except Exception as restart_error:
                                             clog.log("error", f"[AWS ERROR] Restart failed: {restart_error}")
                         
@@ -444,13 +462,14 @@ class ServerState:
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
         clog.log("info", "done with connection")
         
-        # Cleanup persistent AWS stream (only if it was started)
-        if aws_started:
-            try:
-                await aws_transcriber.stop()
-                clog.log("info", "[AWS] Transcriber stopped")
-            except Exception as e:
-                clog.log("error", f"[ERROR] Failed to stop AWS transcriber: {e}")
+        # No explicit cleanup needed for Deepgram (generator will close)
+        # --- Legacy AWS cleanup below (fallback only) ---
+        # if aws_started:
+        #     try:
+        #         await aws_transcriber.stop()
+        #         clog.log("info", "[AWS] Transcriber stopped")
+        #     except Exception as e:
+        #         clog.log("error", f"[ERROR] Failed to stop AWS transcriber: {e}")
         
         return ws
 

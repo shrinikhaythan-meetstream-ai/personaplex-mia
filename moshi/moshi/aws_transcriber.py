@@ -41,6 +41,7 @@ class AWSHandler(TranscriptResultStreamHandler):
             clog.log("info", f"[AWS] Received {len(results)} results from AWS")
             
             for result in results:
+
                 # Process BOTH partial and final transcripts
                 transcript_text = ""
                 is_partial = result.is_partial

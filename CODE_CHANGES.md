@@ -81,76 +81,28 @@ AWS_SECRET_ACCESS_KEY=your_secret_key_here
 
 ---
 
-## STEP 2: FIX AWS TRANSCRIBER (FINAL VERSION)
+## STEP 2: DEEPGRAM REAL-TIME TRANSCRIBER INTEGRATION
 
-### Change 2.1: Use Environment Variables (aws_transcriber.py)
+### Change 2.1: Add Deepgram Transcriber Implementation
+- **File:** `moshi/deepgram_transcriber.py`
+- **Summary:** New module for Deepgram V1 Listen API, supporting live diarization, keep-alive, and word-level speaker extraction.
+- **Key Features:**
+    - Uses `DEEPGRAM_API_KEY` from environment
+    - Streams audio with `nova-3` model, `diarize=True`, `punctuate=True`, `smart_format=True`, `interim_results=True`
+    - Daemon thread sends keep-alive every 5s
+    - Yields `{speaker, word}` dicts for each recognized word
 
-**BEFORE:**
-```python
-import asyncio
-from typing import Optional
-import numpy as np
+### Change 2.2: Switch Main Router to Deepgram
+- **File:** `moshi/server.py`
+- **Summary:**
+    - Import and initialize `DeepgramTranscriber` in `handle_chat`
+    - Pipe live audio chunks to Deepgram stream
+    - Parse and log speaker/word results
+    - **Legacy AWS code is preserved and commented for fallback**
 
-# AWS Configuration
-AWS_REGION = "us-east-1"
-```
+---
 
-**AFTER:**
-```python
-import asyncio
-import os  # ✅ NEW
-from typing import Optional
-import numpy as np
-
-# AWS Configuration from environment  ✅ NEW/MODIFIED
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-```
-
-### Change 2.2: Improve Speaker Detection & Error Handling (aws_transcriber.py)
-
-**BEFORE:**
-```python
-# Extract speaker label
-speaker_label = "unknown"
-if alt.items:
-    speaker_label = getattr(alt.items[0], "speaker", "unknown")
-
-speaker = f"Speaker {speaker_label}" if speaker_label != "unknown" else "Unknown"
-
-clog.log("info", f"[AWS] Final transcript: {speaker}: {transcript_text}")
-
-# Store in context
-self.context_manager.update_transcript({...})
-
-except Exception as e:
-    clog.log("error", f"[AWS] Error processing transcript: {e}")
-```
-
-**AFTER:**
-```python
-# FIX: Reliable speaker detection with proper null checking  ✅ IMPROVED
-speaker_label = "Unknown"
-if hasattr(alt, 'items') and alt.items and len(alt.items) > 0:
-    speaker_attr = getattr(alt.items[0], "speaker", None)
-    if speaker_attr is not None:
-        speaker_label = str(speaker_attr)
-
-speaker = f"Speaker {speaker_label}" if speaker_label != "Unknown" else "Unknown"
-
-clog.log("info", f"[AWS] Final transcript: {speaker}: {transcript_text}")
-
-# Auto-store in context
-self.context_manager.update_transcript({
-    "speaker": speaker,
-    "text": transcript_text,
-    "is_final": True
-})
-
-except Exception as e:
-    clog.log("error", f"[AWS ERROR] Failed to process transcript: {str(e)}")  # ✅ Better error logging
-```
+**NOTE:** No changes made to `aws_transcriber.py` (legacy fallback preserved).
 
 ---
 
@@ -348,210 +300,6 @@ elif text_token == 3:  # EOS token (end of sentence)
         clog.log("info", f"[MODEL] Response stored: {accumulated_model_response.strip()[:100]}...")
         accumulated_model_response = ""
 ```
-
----
-
-## STEP 7: UPDATE REQUIREMENTS.TXT
-
-### Change 7.1: Add Python-Dotenv (requirements.txt)
-
-**BEFORE:**
-```
-aiohttp>=3.10.5,<3.11
-# Multi-user context with AWS Transcribe
-boto3>=1.26.0,<2.0
-amazon-transcribe>=0.6.0,<1.0
-resampy>=0.4.2,<0.5
-soundfile>=0.12.0,<0.13
-```
-
-**AFTER:**
-```
-aiohttp>=3.10.5,<3.11
-# Production-ready: Context-aware multi-user support with AWS Transcribe  ✅ MODIFIED
-python-dotenv>=1.0.0  # ✅ NEW (for .env configuration)
-boto3>=1.26.0,<2.0
-amazon-transcribe>=0.6.0,<1.0
-resampy>=0.4.2,<0.5
-soundfile>=0.12.0,<0.13
-```
-
-### Install with:
-```bash
-pip install -r moshi/requirements.txt
-```
-
----
-
-## TESTING THE UPGRADES
-
-### Test 1: Verify .env Loading
-
-```bash
-# Create .env file
-cat > .env << EOF
-AWS_REGION=us-east-1
-AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-EOF
-
-# Try starting server (will validate on startup)
-python -m moshi.server --device cuda
-
-# Output MUST show:
-# ✓ [INFO] AWS configuration validated
-# ✗ (if missing, crashes with [FATAL] AWS_REGION missing...)
-```
-
-### Test 2: Verify Audio Throttling
-
-```bash
-# Stream 10 seconds of audio and observe logs
-# Expected:
-# [INFO] 100ms audio throttle = ~10 AWS sends/second
-# No "[AWS ERROR] send_audio failed" messages
-# No rate limit errors from AWS
-```
-
-### Test 3: Verify Speaker Detection
-
-```bash
-# Multi-speaker conversation should show:
-# [AWS] Final transcript: Speaker 0: Hello
-# [AWS] Final transcript: Speaker 1: How are you?
-# NOT: Speaker unknown or Generic labels
-```
-
-### Test 4: Verify Context Size Limiting
-
-```bash
-# After 15+ utterances, check:
-clog.log("info", f"[PROMPT] Context size: 15 utterances (limited to 2000 chars)")
-
-# Should NOT show context growing unbounded
-# Last 2000 chars of history returned (keeps recent context)
-```
-
----
-
-## PRODUCTION CHECKLIST
-
-- [ ] `.env` file created with AWS credentials
-- [ ] `AWS_REGION` validated (default us-east-1)
-- [ ] AWS IAM user has Transcribe permissions
-- [ ] `python-dotenv` installed (`pip install python-dotenv`)
-- [ ] Audio throttling tested (no rate limits)
-- [ ] Multi-speaker conversation tested
-- [ ] Context limited to 2000 chars (token budget)
-- [ ] Error logs show `[AWS ERROR]` prefix for debugging
-- [ ] No "connection closed" without "Stream stopped" log
-- [ ] Model responses stored at EOS token
-
----
-
-## DEPLOYMENT GUIDE
-
-### Option 1: Local Testing
-```bash
-cd moshi
-export AWS_REGION=us-east-1
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-python -m server --device cuda
-```
-
-### Option 2: Docker (Recommended)
-```dockerfile
-FROM nvidia/cuda:11.8-runtime-ubuntu22.04
-RUN pip install -r moshi/requirements.txt
-
-# AWS credentials passed as env vars at runtime
-ENV AWS_REGION=us-east-1
-ENV AWS_ACCESS_KEY_ID=<set-at-runtime>
-ENV AWS_SECRET_ACCESS_KEY=<set-at-runtime>
-
-CMD ["python", "-m", "moshi.server"]
-```
-
-### Option 3: Kubernetes
-```yaml
-spec:
-  containers:
-  - env:
-    - name: AWS_REGION
-      valueFrom:
-        configMapKeyRef:
-          name: moshi-config
-          key: aws_region
-    - name: AWS_ACCESS_KEY_ID
-      valueFrom:
-        secretKeyRef:
-          name: aws-credentials
-          key: access_key
-    - name: AWS_SECRET_ACCESS_KEY
-      valueFrom:
-        secretKeyRef:
-          name: aws-credentials
-          key: secret_key
-```
-
----
-
-## MONITORING & DEBUGGING
-
-### Key Log Patterns
-
-```
-✅ EXPECTED:
-[INIT] AWS Transcriber started (single persistent stream)
-[AWS] Final transcript: Speaker 0: ...
-[CONTEXT] Final transcript stored: [Speaker 0]: ...
-[PROMPT] Context size: 5 utterances (limited to 2000 chars)
-[MODEL] Response stored: ...
-[AWS] Stream stopped
-
-❌ PROBLEM SIGNALS:
-[FATAL] AWS_REGION missing → Check .env file
-[AWS ERROR] Failed to process transcript → Check AWS API
-[AWS ERROR] send_audio failed: rate limit → Increase throttle to 0.2s
-[AWS ERROR] Stream closed unexpectedly → Check network/AWS service
-No [MODEL] Response stored → Check EOS token handler
-```
-
-### Cost Optimization
-
-- Throttle = 10 API calls/sec = 36,000/hour
-- US Transcribe = $0.0001/sec = $3.60/hour for 1 connection
-- Multi-user (5x) = $18/hour
-- Set max_history=10 to reduce context
-
----
-
-## BEFORE & AFTER COMPARISON
-
-| Aspect | Before | After |
-|--------|--------|-------|
-| AWS Config | Hardcoded region | Loaded from .env with validation |
-| Speaker Detection | May fail silently | Robust null checking + error logging |
-| Audio API Calls | 24/sec → rate limit | 10/sec → stable |
-| Context Overflow | Unbounded tokens | Limited to 2000 chars |
-| Error Visibility | Silent failures | [AWS ERROR] prefixed logging |
-| Model Response | Accumulated but risky | Stored cleanly at EOS |
-| Production Ready | ❌ No | ✅ Yes |
-
----
-
-## SUMMARY TABLE
-
-| File | Changes | Lines | Status |
-|------|---------|-------|--------|
-| `server.py` | .env support, context limiting, throttling | +15 | ✅ |
-| `context_manager.py` | Improved format, get_recent_context() | +20 | ✅ |
-| `aws_transcriber.py` | Better error handling, speaker detection | +8 | ✅ |
-| `requirements.txt` | Add python-dotenv | +1 | ✅ |
-| `.env.example` | NEW: Config template | 3 lines | ✅ |
-
-**Total:** 5 files modified, ~180 lines added, 0 breaking changes
 
 ---
 
@@ -957,7 +705,7 @@ SESSION ENDS
 ### ✅ Verification Checklist
 
 After applying Step 8:
-- ✅ AWS starts only on first valid audio: `[AWS] Started on first audio (lazy start)`
+- ✅ AWS starts only on first audio: `[AWS] Started on first audio (lazy start)`
 - ✅ Audio sent: `[AWS] Sent audio chunk`
 - ✅ No timeout errors during idle periods
 - ✅ If AWS fails: `[AWS ERROR] Send failed: ...`

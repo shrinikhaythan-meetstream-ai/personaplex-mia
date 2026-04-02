@@ -55,6 +55,7 @@ class ContextManager:
             # Always clear partial first
             self.current_partial = ""
 
+            
             if len(text) <= 2:
                 return  # Ignore noise safely
 
