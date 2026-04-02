@@ -1,24 +1,25 @@
 import os
 import asyncio
 import time
-from deepgram import (
-    DeepgramClient,
-    DeepgramClientOptions,
-    LiveOptions,
-    LiveTranscriptionEvents,
-)
+import json
+from deepgram import DeepgramClient
 from .moshi.context_manager import ContextManager
 from .moshi.utils.logging import ColorizedLog
 
 clog = ColorizedLog.randomize()
 
 class DeepgramTranscriber:
+    """
+    Manages a SINGLE persistent Deepgram stream using universal v3-v6 SDK syntax.
+    """
     def __init__(self, context_manager: ContextManager, 
                  model: str = "nova-3",
                  language: str = "en-US"):
         self.context_manager = context_manager
-        # v6+ logic: initialize without arguments to use environment variables
+        
+        # Initialize client - v6 finds DEEPGRAM_API_KEY automatically
         self.client = DeepgramClient()
+        
         self.model = model
         self.language = language
         self.connection = None
@@ -26,16 +27,18 @@ class DeepgramTranscriber:
         self._audio_queue = asyncio.Queue()
         self.receive_task = None
         self.keepalive_task = None
-        clog.log("info", "[Deepgram] Initialized with latest SDK")
+        clog.log("info", "[Deepgram] Initialized (Version-Agnostic Mode)")
 
     async def start(self) -> None:
         if not self.enabled: return
         try:
+            # We import these INSIDE the function to avoid top-level ImportError
+            from deepgram import LiveTranscriptionEvents, LiveOptions
+            
             clog.log("info", "[Deepgram] Connecting to WebSocket...")
-            # The most stable way to access the live client in v3/v6
             self.connection = self.client.listen.websocket.v("1")
 
-            # Setup event handlers using the event names directly
+            # Setup event handlers using the SDK's internal event strings
             self.connection.on(LiveTranscriptionEvents.Open, lambda *args, **kwargs: clog.log("info", "[Deepgram] Connection opened"))
             self.connection.on(LiveTranscriptionEvents.Transcript, self._on_message)
             self.connection.on(LiveTranscriptionEvents.Error, lambda _, err, **kwargs: clog.log("error", f"[Deepgram ERROR] {err}"))
@@ -72,9 +75,14 @@ class DeepgramTranscriber:
                 clog.log("error", f"[Deepgram] Send error: {e}")
 
     def _on_message(self, *args, **kwargs):
-        # Handle different SDK return signatures safely
-        result = args[1] if len(args) > 1 else None
-        if not result or not hasattr(result, 'channel'): return
+        # The result object is always passed as an argument
+        result = None
+        for arg in args:
+            if hasattr(arg, 'channel'):
+                result = arg
+                break
+        
+        if not result: return
 
         try:
             words = result.channel.alternatives[0].words
@@ -82,6 +90,7 @@ class DeepgramTranscriber:
             if not words: return
 
             transcript_text = " ".join([w.word for w in words])
+            # Default to Speaker 0 if diarization isn't ready
             speaker_id = getattr(words[0], 'speaker', 0)
             speaker_label = f"Speaker {speaker_id}"
 
@@ -110,6 +119,8 @@ class DeepgramTranscriber:
                 self.connection.finish()
             except: pass
             self.connection = None
-            clog.log("info", "[Deepgram] Stream stopped")
+            clog.log("info", "[Deepgram] Stream stopped")   
+
 
             
+                 
