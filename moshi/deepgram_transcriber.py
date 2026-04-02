@@ -1,13 +1,23 @@
+
 import os
-import threading
+import asyncio
 import time
-from typing import Generator, Any
+from typing import Optional
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
 from deepgram.listen.v1.types import ListenV1Results
+from .moshi.context_manager import ContextManager
+from .moshi.utils.logging import ColorizedLog
+
+clog = ColorizedLog.randomize()
 
 class DeepgramTranscriber:
-    def __init__(self, 
+    """
+    Manages a SINGLE persistent Deepgram stream per connection.
+    PCM chunks are sent to this stream without creating new streams.
+    Results are auto-stored in ContextManager via async event handler.
+    """
+    def __init__(self, context_manager: ContextManager, 
                  model: str = "nova-3",
                  language: str = "en-US",
                  punctuate: bool = True,
@@ -17,6 +27,7 @@ class DeepgramTranscriber:
         api_key = os.getenv("DEEPGRAM_API_KEY")
         if not api_key:
             raise EnvironmentError("DEEPGRAM_API_KEY environment variable not set.")
+        self.context_manager = context_manager
         self.client = DeepgramClient(api_key)
         self.model = model
         self.language = language
@@ -25,64 +36,126 @@ class DeepgramTranscriber:
         self.interim_results = interim_results
         self.diarize = diarize
         self.connection = None
-        self._stop_keepalive = threading.Event()
-        self._results = []
-        self._lock = threading.Lock()
+        self.enabled = True
+        self.last_audio_time = 0
+        self.keepalive_task = None
+        self.receive_task = None
+        self._audio_queue = asyncio.Queue()
+        clog.log("info", "[Deepgram] DeepgramTranscriber initialized (single persistent stream mode)")
 
-    def _on_message(self, message: Any):
+    async def start(self) -> None:
+        """
+        Start a SINGLE persistent Deepgram stream for this connection.
+        PCM chunks are sent to it via send_audio().
+        Results processed automatically in background.
+        """
+        if not self.enabled:
+            clog.log("warning", "[Deepgram] Deepgram disabled, skipping stream start")
+            return
+        try:
+            clog.log("info", "[Deepgram] Starting persistent stream...")
+            self.connection = self.client.listen.v1.connect(
+                model=self.model,
+                language=self.language,
+                punctuate=self.punctuate,
+                smart_format=self.smart_format,
+                interim_results=self.interim_results,
+                diarize=self.diarize,
+            )
+            self.connection.on(EventType.OPEN, lambda _: clog.log("info", "[Deepgram] Connection opened"))
+            self.connection.on(EventType.CLOSE, lambda _: clog.log("info", "[Deepgram] Connection closed"))
+            self.connection.on(EventType.ERROR, lambda err: clog.log("error", f"[Deepgram ERROR] {err}"))
+            self.connection.on(EventType.MESSAGE, self._on_message)
+            self.connection.start_listening()
+            self.keepalive_task = asyncio.create_task(self._keepalive_loop())
+            self.receive_task = asyncio.create_task(self._audio_send_loop())
+            clog.log("info", "[Deepgram] Persistent stream created and listening with keepalive")
+        except Exception as e:
+            clog.log("error", f"[Deepgram] Failed to start stream: {e}")
+            self.enabled = False
+
+    async def send_audio(self, pcm_bytes: bytes) -> None:
+        """
+        Send PCM audio chunk to persistent stream.
+        This is called for every PCM frame. Uses same stream (not new one).
+        Args:
+            pcm_bytes: int16 PCM audio bytes, 16kHz sample rate
+        """
+        if not self.enabled or not self.connection:
+            return
+        self.last_audio_time = time.time()
+        await self._audio_queue.put(pcm_bytes)
+
+    async def _audio_send_loop(self) -> None:
+        """
+        Background loop that sends audio from queue to Deepgram stream.
+        """
+        while self.connection and self.enabled:
+            pcm_bytes = await self._audio_queue.get()
+            try:
+                self.connection.send_media(pcm_bytes)
+            except Exception as e:
+                clog.log("error", f"[Deepgram] Error sending audio: {e}")
+
+    def _on_message(self, message):
         if isinstance(message, ListenV1Results):
             words = message.channel.alternatives[0].words if message.channel else []
-            if words and message.is_final:
-                with self._lock:
-                    for w in words:
-                        self._results.append({
-                            "speaker": w.speaker,
-                            "word": w.word
-                        })
+            is_final = getattr(message, 'is_final', False)
+            transcript_text = " ".join([w.word for w in words])
+            for w in words:
+                speaker_label = f"Speaker {w.speaker}" if hasattr(w, 'speaker') else "Speaker 0"
+                log_type = "FINAL" if is_final else "PARTIAL"
+                clog.log("info", f"[Deepgram] {log_type} transcript: {speaker_label}: {w.word}")
+            if transcript_text:
+                # Only store FINAL transcripts to context
+                if is_final:
+                    self.context_manager.update_transcript({
+                        "speaker": speaker_label,
+                        "text": transcript_text,
+                        "is_final": True
+                    })
+                    clog.log("info", f"[DEEPGRAM TRANSCRIPT STORED] {speaker_label}: {transcript_text}")
+                else:
+                    self.context_manager.update_transcript({
+                        "speaker": speaker_label,
+                        "text": transcript_text,
+                        "is_final": False
+                    })
 
-    def _keep_alive_loop(self):
-        while not self._stop_keepalive.is_set():
-            if self.connection:
-                self.connection.send_keep_alive()
-            time.sleep(5)
-
-    def stream(self, audio_chunks: Generator[bytes, None, None]) -> Generator[dict, None, None]:
+    async def _keepalive_loop(self) -> None:
         """
-        Accepts a generator of audio chunks (bytes) and yields dicts with 'speaker' and 'word'.
+        Send keepalive every 5 seconds to keep Deepgram stream alive.
         """
-        with self.client.listen.v1.connect(
-            model=self.model,
-            language=self.language,
-            punctuate=self.punctuate,
-            smart_format=self.smart_format,
-            interim_results=self.interim_results,
-            diarize=self.diarize,
-        ) as connection:
-            self.connection = connection
-            connection.on(EventType.OPEN, lambda _: None)
-            connection.on(EventType.MESSAGE, self._on_message)
-            connection.on(EventType.CLOSE, lambda _: None)
-            connection.on(EventType.ERROR, lambda err: print(f"Deepgram error: {err}"))
-
-            # Start keep-alive thread
-            ka_thread = threading.Thread(target=self._keep_alive_loop, daemon=True)
-            ka_thread.start()
-
-            connection.start_listening()
+        while self.connection and self.enabled:
+            await asyncio.sleep(5)
             try:
-                for chunk in audio_chunks:
-                    connection.send_media(chunk)
-                    # Yield results as they come in
-                    with self._lock:
-                        while self._results:
-                            yield self._results.pop(0)
-            finally:
-                self._stop_keepalive.set()
-                ka_thread.join(timeout=1)
-                connection.finish()
+                self.connection.send_keep_alive()
+                clog.log("info", "[Deepgram] Keepalive: sent keepalive to keep stream alive")
+            except Exception as e:
+                clog.log("info", f"[Deepgram] Keepalive failed (stream may have closed): {e}")
+                break
 
-# Usage example (to be called by the main router):
-# from deepgram_transcriber import DeepgramTranscriber
-# transcriber = DeepgramTranscriber()
-# for result in transcriber.stream(audio_chunks):
-#     print(result)  # {'speaker': ..., 'word': ...}
+    async def stop(self) -> None:
+        """
+        Close persistent stream (called on connection close).
+        """
+        self.enabled = False
+        if self.keepalive_task:
+            self.keepalive_task.cancel()
+            try:
+                await self.keepalive_task
+            except asyncio.CancelledError:
+                pass
+        if self.receive_task:
+            self.receive_task.cancel()
+            try:
+                await self.receive_task
+            except asyncio.CancelledError:
+                pass
+        if self.connection:
+            try:
+                self.connection.finish()
+                self.connection = None
+                clog.log("info", "[Deepgram] Stream stopped")
+            except Exception as e:
+                clog.log("error", f"[Deepgram] Error stopping stream: {e}")
