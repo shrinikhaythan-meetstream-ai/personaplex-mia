@@ -338,6 +338,10 @@ class ServerState:
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
                         _ = self.other_mimi.decode(tokens[:, 1:9])
                         main_pcm = main_pcm.cpu()
+                        # --- THE ACOUSTIC GATE ---
+                        # If muted, crush the audio wave to pure 0.0 (Absolute Silence)
+                        if is_agent_muted:
+                            main_pcm = main_pcm * 0.0
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
@@ -379,8 +383,8 @@ class ServerState:
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
                     # Gate: only stream audio bytes to the client when unmuted.
-                    if not is_agent_muted:
-                        await ws.send_bytes(b"\x01" + msg)
+                
+                    await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
