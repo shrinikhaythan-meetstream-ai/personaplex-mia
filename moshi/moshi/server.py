@@ -257,11 +257,17 @@ class ServerState:
                                     pcm_16k = pcm_int16
                                 
                                 if deepgram_started:
-                                    try:
-                                        await deepgram_transcriber.send_audio(pcm_16k.tobytes())
-                                    except Exception as send_error:
-                                        clog.log("error", f"[Deepgram ERROR] Send failed: {send_error}")
-
+                                    
+                                        # Create a mini "background thread" function
+                                    async def background_send(audio_data):
+                                        try:
+                                            await deepgram_transcriber.send_audio(audio_data)
+                                        except Exception as send_error:
+                                            clog.log("error", f"[Deepgram ERROR] Send failed: {send_error}")
+                                    
+                                    # FIRE AND FORGET! 
+                                    # This instantly spins up a background task and moves on immediately.
+                                    asyncio.create_task(background_send(pcm_16k.tobytes()))
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
