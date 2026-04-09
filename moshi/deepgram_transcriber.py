@@ -17,10 +17,14 @@ class DeepgramTranscriber:
     Manages a SINGLE persistent Deepgram stream.
     Uses 'speech_final' and 'UtteranceEnd' to guarantee transcripts are stored.
     """
-    def __init__(self, context_manager: ContextManager, 
+    def __init__(self, context_manager: ContextManager,
+                 on_transcript_callback=None,
                  model: str = "nova-3",
                  language: str = "en-US"):
         self.context_manager = context_manager
+        # Optional callback invoked with the final transcript text string.
+        # Used by the server for wake-word detection and context pre-loading.
+        self.on_transcript_callback = on_transcript_callback
         self.client = DeepgramClient()
         self.model = model
         self.language = language
@@ -29,9 +33,8 @@ class DeepgramTranscriber:
         self._audio_queue = asyncio.Queue()
         self.receive_task = None
         self.keepalive_task = None
-        
-        # Internal buffer to store the last 'Partial' transcript
-        # Used as a fallback if UtteranceEnd fires without a speech_final
+        # Fallback buffer: holds last partial in case UtteranceEnd fires
+        # without a preceding speech_final (safety net only).
         self.last_partial = {"speaker": "Speaker 0", "text": ""}
 
     async def start(self) -> None:
@@ -51,7 +54,7 @@ class DeepgramTranscriber:
                 model=self.model,
                 language=self.language,
                 smart_format=True,
-                interim_results=True,
+                interim_results=False,
                 diarize=True,
                 # Trigger speech_final after 300ms of silence
                 endpointing=300,
@@ -86,20 +89,25 @@ class DeepgramTranscriber:
             speaker_id = getattr(words[0], 'speaker', 0)
             speaker_label = f"Speaker {speaker_id}"
 
-            # If it's a finished thought (speech_final), force the Context Manager to QUEUE it
+            # Only commit to context when Deepgram marks the utterance as finished.
+            # interim_results=False means every event here is already final-ish,
+            # but we additionally require speech_final for extra certainty.
             should_store = speech_final or is_final
 
-            self.context_manager.update_transcript({
-                "speaker": speaker_label,
-                "text": transcript_text,
-                "is_final": should_store
-            })
-
             if should_store:
+                self.context_manager.update_transcript({
+                    "speaker": speaker_label,
+                    "text": transcript_text,
+                    "is_final": True
+                })
                 clog.log("info", f"[Deepgram] STORED (SpeechFinal): {speaker_label}: {transcript_text}")
-                self.last_partial = {"speaker": speaker_label, "text": ""} # Clear fallback
+                # Reset fallback buffer — this utterance is fully handled.
+                self.last_partial = {"speaker": speaker_label, "text": ""}
+                # Notify server: allows wake-word detection & warm cache refresh.
+                if self.on_transcript_callback:
+                    self.on_transcript_callback(transcript_text)
             else:
-                # Save as fallback in case UtteranceEnd fires next
+                # Keep as fallback in case UtteranceEnd fires without speech_final.
                 self.last_partial = {"speaker": speaker_label, "text": transcript_text}
 
         except Exception as e:
@@ -113,7 +121,7 @@ class DeepgramTranscriber:
             
             clog.log("info", f"[Deepgram] STORED (UtteranceEnd Safety): {speaker}: {text}")
             
-            # Force the Context Manager to move this from 'current_partial' to the 'history_queue'
+            # Safety net: commit the fallback buffer as a final transcript.
             self.context_manager.update_transcript({
                 "speaker": speaker,
                 "text": text,

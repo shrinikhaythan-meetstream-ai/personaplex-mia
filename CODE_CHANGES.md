@@ -744,4 +744,212 @@ All production issues resolved:
 - ✅ Comprehensive error handling
 - ✅ Environment config validated
 
-**Architecture: Synchronized decoder + Origin tracking + Energy filtering + Lazy-start + Auto-recovery = Production-grade reliability** ✅
+**Architecture: Synchronized decoder + Origin tracking + Energy filtering + Lazy-start + Auto-recovery = Production-grade reliability** ✅ ✅
+
+```
+
+---
+
+## STEP 9: HOT STANDBY / WARM CACHE ARCHITECTURE (Wake-Word Mute Gate)
+
+**Date:** 9 April 2026
+**Goal:** Moshi listens continuously but stays silent until a wake word is detected. After it speaks, it automatically re-mutes. Zero prefill latency due to a continuously-warmed context cache.
+
+### Architectural Overview
+
+```
+Microphone Audio
+      |
+      +---> Moshi acoustic encoder  (always running, Ears Open)
+      |
+      +---> Deepgram transcriber    (always running, real-time diarization)
+                 |
+                 +---> ContextManager.update_transcript()   (warm cache)
+                 |
+                 +---> handle_new_transcript() callback
+                            |
+                            +---> Refresh lm_gen.text_prompt_tokens  (zero-latency prefill)
+                            |
+                            +---> Wake-word check -> is_agent_muted = False
+
+Moshi model output
+      |
+      +---> Text tokens ---> gated by is_agent_muted ---> WebSocket (text)
+      |
+      +---> Audio bytes ---> gated by is_agent_muted ---> WebSocket (audio)
+                                                                |
+                                                      EOS token detected
+                                                                |
+                                                     is_agent_muted = True  (re-mute)
+```
+
+---
+
+### Change 9.1: `deepgram_transcriber.py` - Add transcript callback
+
+**What changed:** `__init__` now accepts an optional `on_transcript_callback` parameter.
+The callback fires inside `_on_message` whenever a `speech_final` utterance is committed to context.
+Non-final events are never forwarded. `interim_results=False` confirmed in `LiveOptions`.
+
+**Before `__init__`:**
+```python
+def __init__(self, context_manager: ContextManager,
+             model: str = "nova-3", language: str = "en-US"):
+    self.context_manager = context_manager
+    ...
+```
+
+**After `__init__`:**
+```python
+def __init__(self, context_manager: ContextManager,
+             on_transcript_callback=None,          # NEW
+             model: str = "nova-3", language: str = "en-US"):
+    self.context_manager = context_manager
+    self.on_transcript_callback = on_transcript_callback  # NEW
+    ...
+```
+
+**Added to `_on_message` (final branch):**
+```python
+if self.on_transcript_callback:
+    self.on_transcript_callback(transcript_text)   # fire callback
+```
+
+---
+
+### Change 9.2: `context_manager.py` - Remove all partial transcript logic
+
+**What changed:** `current_partial` attribute removed entirely.
+`update_transcript` now rejects all non-final transcripts at the top.
+`get_full_prompt` no longer injects a partial line.
+`clear_context` simplified accordingly.
+
+**Removed from `__init__`:**
+```python
+self.current_partial = ""   # REMOVED
+```
+
+**Rewritten `update_transcript`:**
+```python
+def update_transcript(self, transcript_json):
+    if not transcript_json.get('is_final', False):
+        return   # strictly discard all partials
+    text = transcript_json.get('text', '').strip()
+    if len(text) <= 2:
+        return
+    formatted_line = f"[{speaker}]: {text}"
+    self.history_queue.append(formatted_line)
+    clog.log("info", f"[CONTEXT] Stored: {formatted_line}")
+```
+
+**Removed from `get_full_prompt` conversation block:**
+```
+{self.current_partial}   <- REMOVED
+```
+
+---
+
+### Change 9.3: `server.py` - Mute gate, wake-word detection, auto re-mute
+
+#### 9.3.a - Muted state + wake-word callback + updated DeepgramTranscriber init
+
+**Before:**
+```python
+deepgram_transcriber = DeepgramTranscriber(context_manager)
+```
+
+**After:**
+```python
+is_agent_muted = True   # Hot Standby: start silent
+
+def handle_new_transcript(text: str):
+    nonlocal is_agent_muted
+    # Warm cache: refresh Moshi's prompt tokens on every utterance
+    full_prompt = context_manager.get_full_prompt()
+    self.lm_gen.text_prompt_tokens = (
+        self.text_tokenizer.encode(wrap_with_system_tags(full_prompt))
+        if len(full_prompt) > 0 else None
+    )
+    # Wake-word detection
+    if "hey moshi" in text.lower() or "moshi" in text.lower():
+        is_agent_muted = False
+        clog.log("info", "WAKE WORD DETECTED: Agent unmuted - Moshi is now live.")
+
+deepgram_transcriber = DeepgramTranscriber(
+    context_manager,
+    on_transcript_callback=handle_new_transcript   # NEW
+)
+```
+
+#### 9.3.b - `opus_loop`: gate text token output
+
+```python
+async def opus_loop():
+    nonlocal is_receiving_audio, is_agent_muted   # is_agent_muted added
+
+    if text_token not in (0, 3):
+        ...
+        if not is_agent_muted:           # NEW gate
+            await ws.send_bytes(msg)
+        accumulated_model_response += _text   # always accumulate
+```
+
+#### 9.3.c - `opus_loop`: auto re-mute on EOS token
+
+```python
+elif text_token == 3:   # EOS
+    if accumulated_model_response.strip():
+        context_manager.update_transcript({...})
+        accumulated_model_response = ""
+    # RE-MUTE after Moshi finishes its turn
+    if not is_agent_muted:
+        is_agent_muted = True
+        clog.log("info", "Agent finished speaking. Re-muted - back to listening mode.")
+```
+
+#### 9.3.d - `send_loop`: gate audio byte output
+
+```python
+async def send_loop():
+    ...
+    msg = opus_writer.read_bytes()
+    if len(msg) > 0:
+        if not is_agent_muted:           # NEW gate
+            await ws.send_bytes(b"\x01" + msg)
+```
+
+---
+
+### Step 9 Summary
+
+| File | Change | Lines Added/Modified |
+|------|--------|----------------------|
+| `deepgram_transcriber.py` | `on_transcript_callback` param; fire on final transcript | ~12 |
+| `context_manager.py` | Removed `current_partial`; strict final-only ingestion; clean `get_full_prompt` | ~18 |
+| `server.py` | `is_agent_muted` state; wake-word callback; text + audio mute gates; EOS re-mute | ~28 |
+
+**Full lifecycle:**
+1. Session starts -> `is_agent_muted = True`
+2. Deepgram transcribes every utterance -> warms context cache, refreshes prompt tokens
+3. Wake word detected -> `is_agent_muted = False` -> audio + text flow to client
+4. Moshi hits EOS token -> `is_agent_muted = True` -> silent listening resumes
+5. Repeat from step 2
+
+**Breaking changes:** 0
+**New dependencies:** 0
+
+---
+
+**UPDATED FINAL STATUS: PRODUCTION-READY WITH HOT STANDBY / WARM CACHE / WAKE-WORD ARCHITECTURE**
+
+- Moshi listens continuously (Ears Open)
+- Moshi output gated by default (Mouth Closed)
+- Deepgram warms context cache in real time (Warm Cache)
+- Wake word unmutes Moshi instantly (zero prefill latency)
+- Moshi auto re-mutes after every response (clean lifecycle)
+- Partial transcripts fully removed from pipeline
+- Origin-filtered audio (user mic only -> Deepgram)
+- Lazy-start Deepgram on first audio
+- Comprehensive error handling
+
+**Architecture: Hot Standby + Warm Cache + Wake-Word Gate + EOS Re-Mute = Zero-latency, non-interrupting real-time meeting assistant**

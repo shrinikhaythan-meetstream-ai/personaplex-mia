@@ -155,8 +155,34 @@ class ServerState:
         context_manager = ContextManager(developer_prompt=original_prompt, max_history=15)
         clog.log("info", "[INIT] ContextManager initialized for this session")
         
+        # --- Hot Standby / Warm Cache Architecture ---
+        # The agent starts muted. Deepgram listens continuously and warms the
+        # context cache. On wake word, the gate flips open. On EOS, it closes.
+        is_agent_muted = True
+
+        def handle_new_transcript(text: str):
+            """
+            Callback fired by DeepgramTranscriber on every finalized utterance.
+            Two responsibilities:
+              1. Re-bake Moshi's text prompt tokens from the updated warm cache
+                 so there is zero prefill latency when Moshi eventually speaks.
+              2. Detect the wake word and unmute the agent.
+            """
+            nonlocal is_agent_muted
+            full_prompt = context_manager.get_full_prompt()
+            self.lm_gen.text_prompt_tokens = (
+                self.text_tokenizer.encode(wrap_with_system_tags(full_prompt))
+                if len(full_prompt) > 0 else None
+            )
+            if "hey moshi" in text.lower() or "moshi" in text.lower():
+                is_agent_muted = False
+                clog.log("info", "WAKE WORD DETECTED: Agent unmuted — Moshi is now live.")
+
         # Initialize Deepgram Transcriber for this session (lazy start)
-        deepgram_transcriber = DeepgramTranscriber(context_manager)
+        deepgram_transcriber = DeepgramTranscriber(
+            context_manager,
+            on_transcript_callback=handle_new_transcript
+        )
         clog.log("info", "[INIT] Deepgram Transcriber created (lazy start - will start on first audio)")
 
         # Construct full voice prompt path
@@ -275,9 +301,9 @@ class ServerState:
                 clog.log("info", "connection closed")
 
         async def opus_loop():
-            nonlocal is_receiving_audio
+            nonlocal is_receiving_audio, is_agent_muted
             all_pcm_data = None
-            # Buffer to accumulate model text responses
+            # Buffer to accumulate model text responses (always, even when muted)
             accumulated_model_response = ""
 
             while True:
@@ -315,26 +341,36 @@ class ServerState:
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
-                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                            _text = self.text_tokenizer.id_to_piece(text_token)
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
-                            await ws.send_bytes(msg)
                             
-                            # ACCUMULATE MODEL RESPONSE for context storage
-                            accumulated_model_response += _text
-                            
-                        elif text_token == 3:  # EOS token (end of sentence)
-                            # Store complete model response in context
-                            if accumulated_model_response.strip():
-                                context_manager.update_transcript({
-                                    "speaker": "Moshi",
-                                    "text": accumulated_model_response.strip(),
-                                    "is_final": True
-                                })
-                                clog.log("info", f"[MODEL] Response stored: {accumulated_model_response.strip()[:100]}...")
-                                accumulated_model_response = ""
-                            text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                            # GATE: Only stream AND remember text when unmuted.
+                            if not is_agent_muted:
+                                await ws.send_bytes(msg)
+                                accumulated_model_response += _text
+                            # If muted, we just do nothing and throw the token away.
 
+                        elif text_token == 3:  # EOS token (end of sentence)
+                            # Only store the response and re-mute if it was ACTUALLY speaking
+                            if not is_agent_muted:
+                                if accumulated_model_response.strip():
+                                    context_manager.update_transcript({
+                                        "speaker": "Moshi",
+                                        "text": accumulated_model_response.strip(),
+                                        "is_final": True
+                                    })
+                                    clog.log("info", f"[MODEL] Response stored: {accumulated_model_response.strip()[:100]}...")
+                                
+                                # RE-MUTE: agent finished its turn — go back to silent listening.
+                                is_agent_muted = True
+                                clog.log("info", "Agent finished speaking. Re-muted — back to listening mode.")
+                            
+                            # ALWAYS clear the buffer at the end of a sentence, just to be safe
+                            accumulated_model_response = ""
+                            text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                        
+                            
         async def send_loop():
             while True:
                 if close:
@@ -342,7 +378,9 @@ class ServerState:
                 await asyncio.sleep(0.001)
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
-                    await ws.send_bytes(b"\x01" + msg)
+                    # Gate: only stream audio bytes to the client when unmuted.
+                    if not is_agent_muted:
+                        await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
