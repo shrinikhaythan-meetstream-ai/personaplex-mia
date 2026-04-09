@@ -299,7 +299,7 @@ class ServerState:
                     _ = self.other_mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
-                        await asyncio.sleep(0)
+                        await asyncio.sleep(0.005)
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
