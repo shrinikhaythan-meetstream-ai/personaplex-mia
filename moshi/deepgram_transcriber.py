@@ -59,7 +59,7 @@ class DeepgramTranscriber:
                 # Trigger speech_final after 300ms of silence
                 endpointing=300,
                 # Trigger UtteranceEnd event after 1000ms gap in words (Fail-safe)
-                utterance_end_ms=1000,
+    
                 encoding="linear16",
                 sample_rate=16000,
                 channels=1
